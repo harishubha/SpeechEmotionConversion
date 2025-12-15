@@ -1,0 +1,699 @@
+import os
+import math
+import json
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import soundfile as sf
+import pandas as pd
+
+from torch.nn.utils import weight_norm, remove_weight_norm
+
+# ============================================================
+# DEVICE
+# ============================================================
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", device)
+
+# ============================================================
+# CONSTANTS / CONFIG
+# ============================================================
+
+K = 200
+PAD = 0
+SHIFT = 1
+BOS = K + SHIFT        # 201
+EOS = K + SHIFT + 1    # 202
+VOCAB_SIZE = K + SHIFT + 2   # 203
+SAMPLE_RATE = 16000
+
+ES2S_CKPT      = "es2s_transformer.pt"
+PROSODY_CKPT   = "prosody_predictor.pt"
+HIFIGAN_DIR    = "HifiGanCheckpoint"
+HIFIGAN_CONFIG = os.path.join(HIFIGAN_DIR, "config.json")
+HIFIGAN_CKPT   = os.path.join(HIFIGAN_DIR, "g_00400000")
+
+# dataset root (same as training)
+DATA_ROOT = "/data/b22_shruti_chaudhary/.cache/kagglehub/datasets/phantasm34/emovdb-sorted/versions/1"
+
+
+def normalize_path(p: str) -> str:
+    return p.replace("\\", "/")
+
+
+def kaggle_to_local(path):
+    # take last 3 components: speaker/emotion/file.wav
+    parts = path.replace("\\", "/").split("/")
+    tail = "/".join(parts[-3:])
+    return os.path.join(DATA_ROOT, tail)
+
+
+# ============================================================
+# LOAD METADATA
+# ============================================================
+
+# Discrete units: paths + units_dedup
+discrete = torch.load("discrete_units.pt", map_location=device, weights_only=False)
+paths = discrete["paths"]            # list of filepaths (string, Kaggle-style)
+units_dedup = discrete["units_dedup"]  # list of unit sequences (list[int])
+
+# Manifest
+df = pd.read_csv("emovdb_manifest.csv")
+
+
+def to_rel(p: str) -> str:
+    p = p.replace("\\", "/")
+    return "/".join(p.split("/")[-3:])
+
+
+df["relpath"] = df["filepath"].apply(to_rel)
+
+# Emotions
+label_map = torch.load("label_mappings.pt", map_location=device)
+emotion2id = label_map["emotion2id"]
+id2emotion = {v: k for k, v in emotion2id.items()}
+num_emotions = len(emotion2id)
+
+# Speakers
+spk_table = torch.load("speaker_table.pt", map_location=device)
+speaker2id = spk_table["speaker2id"]
+id2speaker = {v: k for k, v in speaker2id.items()}
+spk_dim = spk_table["spk_dim"]
+num_speakers = len(speaker2id)
+
+# ============================================================
+# HELPERS: speaker / emotion lookup from path
+# ============================================================
+
+def get_speaker_id_from_path(path: str) -> int:
+    rel = to_rel(path)
+    row = df[df["relpath"] == rel]
+    if row.empty:
+        return 0
+    spk = row.iloc[0]["speaker"]
+    return speaker2id.get(spk, 0)
+
+
+def get_emotion_id_from_path(path: str) -> int:
+    rel = to_rel(path)
+    row = df[df["relpath"] == rel]
+    if row.empty:
+        return 0
+    emo = row.iloc[0]["emotion"]
+    return emotion2id.get(emo, 0)
+
+
+def get_speaker_name(spk_id: int) -> str:
+    return id2speaker.get(int(spk_id), "UNK")
+
+
+def get_emotion_name(emo_id: int) -> str:
+    return id2emotion.get(int(emo_id), "UNK")
+
+
+# ============================================================
+# UTILS
+# ============================================================
+
+def log_norm_f0(f0: torch.Tensor) -> torch.Tensor:
+    f0 = f0.clone()
+    f0[f0 <= 0] = 1.0
+    f0 = torch.log(f0)
+    m = f0.mean()
+    s = f0.std().clamp(min=1e-6)
+    return (f0 - m) / s
+
+
+# ============================================================
+# SPEAKER LOOKUP (for prosody model)
+# ============================================================
+
+class SpeakerLookup(nn.Module):
+    def __init__(self, num_speakers, spk_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(num_speakers, spk_dim)
+
+    def forward(self, spk_ids):
+        return self.embedding(spk_ids)
+
+
+spk_lookup = SpeakerLookup(num_speakers, spk_dim).to(device)
+spk_lookup.load_state_dict(spk_table["state_dict"])
+spk_lookup.eval()
+
+# ============================================================
+# 1) EMOTION TRANSFORMER (ES2S) — same as training
+# ============================================================
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.pe = pe.unsqueeze(0)
+
+    def forward(self, x):
+        # x: (B, T, D) in spirit, but we only use length
+        return self.pe[:, :x.size(1)].to(x.device)
+
+
+class EmotionTransformer(nn.Module):
+    def __init__(
+        self,
+        num_emotions,
+        vocab_size=VOCAB_SIZE,
+        d_model=512,
+        nhead=8,
+        num_layers=6,
+        dim_feedforward=2048,
+        dropout=0.1,
+        max_len=4096
+    ):
+        super().__init__()
+        self.num_emotions = num_emotions
+        self.vocab_size = vocab_size
+        self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=PAD)
+        self.pos_enc = PositionalEncoding(d_model, max_len=max_len)
+        self.encoders = nn.ModuleDict()
+        self.decoders = nn.ModuleDict()
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout
+        )
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout
+        )
+
+        for e in range(num_emotions):
+            self.encoders[str(e)] = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+            self.decoders[str(e)] = nn.TransformerDecoder(dec_layer, num_layers=num_layers)
+
+        self.output_proj = nn.Linear(d_model, vocab_size)
+        self.d_model = d_model
+
+    def encode(self, src_tokens, src_mask, emotion_id):
+        # src_tokens: (B, T)
+        e = str(int(emotion_id))
+        x = self.token_emb(src_tokens) * math.sqrt(self.d_model)
+        x = x + self.pos_enc(x)
+        x = x.transpose(0, 1)  # (T,B,D)
+        memory = self.encoders[e](x, src_key_padding_mask=src_mask)
+        return memory
+
+    def decode(self, tgt_tokens, memory, memory_mask, emotion_id, tgt_mask):
+        # tgt_tokens: (B, T_tgt)
+        e = str(int(emotion_id))
+        y = self.token_emb(tgt_tokens) * math.sqrt(self.d_model)
+        y = y + self.pos_enc(y)
+        y = y.transpose(0, 1)  # (T,B,D)
+        out = self.decoders[e](
+            y,
+            memory,
+            tgt_mask=tgt_mask,
+            memory_key_padding_mask=memory_mask
+        )
+        out = out.transpose(0, 1)  # (B,T,D)
+        logits = self.output_proj(out)
+        return logits
+
+    def generate_square_subsequent_mask(self, sz):
+        return torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
+
+
+def greedy_decode_es2s(model, src, src_mask, src_em, tgt_em, max_len=400):
+    """
+    Returns SHIFTED tokens (1..K) without BOS/EOS/PAD.
+    """
+    model.eval()
+    with torch.no_grad():
+        memory = model.encode(src, src_mask, src_em)
+        ys = torch.tensor([[BOS]], dtype=torch.long).to(device)
+
+        for _ in range(max_len):
+            tgt_mask = model.generate_square_subsequent_mask(ys.size(1)).to(device)
+            out = model.decode(ys, memory, src_mask, tgt_em, tgt_mask)
+            nxt = out[:, -1, :].argmax(-1, keepdim=True)
+            ys = torch.cat([ys, nxt], dim=1)
+            if nxt.item() == EOS:
+                break
+
+    # remove BOS/EOS/PAD, keep SHIFTED 1..K
+    seq = ys.squeeze(0).tolist()
+    seq = [t for t in seq if t not in (BOS, EOS, PAD)]
+    return seq  # SHIFTED tokens (1..K)
+
+
+# ============================================================
+# 2) PROSODY PREDICTOR — same as training
+# ============================================================
+
+class ProsodyPredictor(nn.Module):
+    def __init__(self, vocab_size, num_emotions, spk_dim, d_model=256, nhead=4, num_layers=3, ff=512):
+        super().__init__()
+        self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=PAD)
+        self.emo_emb = nn.Embedding(num_emotions, d_model)
+        self.proj_spk = nn.Linear(spk_dim, d_model)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=ff,
+            batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.f0_head = nn.Linear(d_model, 1)
+        self.dur_head = nn.Linear(d_model, 1)
+
+    def forward(self, units, emo_ids, spk_vecs, src_key_padding_mask):
+        # units: (B,T) (SHIFTED)
+        # emo_ids: (B,)
+        # spk_vecs: (B, spk_dim)
+        x_tok = self.token_emb(units)
+        x_emo = self.emo_emb(emo_ids).unsqueeze(1)
+        x_spk = self.proj_spk(spk_vecs).unsqueeze(1)
+        x = x_tok + x_emo + x_spk
+        h = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
+        f0 = self.f0_head(h).squeeze(-1)   # (B,T)
+        dur = self.dur_head(h).squeeze(-1) # (B,T)
+        return f0, dur
+
+
+# ============================================================
+# HIFIGAN (FAIRSEQ) GENERATOR
+# ============================================================
+
+def get_padding(kernel_size, dilation=1):
+    return int((kernel_size * dilation - dilation) // 2)
+
+
+class ResBlock1(nn.Module):
+    def __init__(self, h, channels, kernel_size=3, dilation=(1, 3, 5)):
+        super().__init__()
+        self.h = h
+        self.convs1 = nn.ModuleList([
+            weight_norm(nn.Conv1d(
+                channels, channels, kernel_size, 1,
+                dilation=dilation[0], padding=get_padding(kernel_size, dilation[0])
+            )),
+            weight_norm(nn.Conv1d(
+                channels, channels, kernel_size, 1,
+                dilation=dilation[1], padding=get_padding(kernel_size, dilation[1])
+            )),
+            weight_norm(nn.Conv1d(
+                channels, channels, kernel_size, 1,
+                dilation=dilation[2], padding=get_padding(kernel_size, dilation[2])
+            )),
+        ])
+        self.convs2 = nn.ModuleList([
+            weight_norm(nn.Conv1d(
+                channels, channels, kernel_size, 1,
+                dilation=1, padding=get_padding(kernel_size, 1)
+            )),
+            weight_norm(nn.Conv1d(
+                channels, channels, kernel_size, 1,
+                dilation=1, padding=get_padding(kernel_size, 1)
+            )),
+            weight_norm(nn.Conv1d(
+                channels, channels, kernel_size, 1,
+                dilation=1, padding=get_padding(kernel_size, 1)
+            )),
+        ])
+
+    def forward(self, x):
+        for c1, c2 in zip(self.convs1, self.convs2):
+            xt = F.leaky_relu(x, 0.1)
+            xt = c1(xt)
+            xt = F.leaky_relu(xt, 0.1)
+            xt = c2(xt)
+            x = xt + x
+        return x
+
+    def remove_weight_norm(self):
+        for l in self.convs1:
+            remove_weight_norm(l)
+        for l in self.convs2:
+            remove_weight_norm(l)
+
+
+class ResBlock2(nn.Module):
+    def __init__(self, h, channels, kernel_size=3, dilation=(1, 3)):
+        super().__init__()
+        self.h = h
+        self.convs = nn.ModuleList([
+            weight_norm(nn.Conv1d(
+                channels, channels, kernel_size, 1,
+                dilation=dilation[0], padding=get_padding(kernel_size, dilation[0])
+            )),
+            weight_norm(nn.Conv1d(
+                channels, channels, kernel_size, 1,
+                dilation=dilation[1], padding=get_padding(kernel_size, dilation[1])
+            )),
+        ])
+
+    def forward(self, x):
+        for c in self.convs:
+            xt = F.leaky_relu(x, 0.1)
+            xt = c(xt)
+            x = xt + x
+        return x
+
+    def remove_weight_norm(self):
+        for l in self.convs:
+            remove_weight_norm(l)
+
+
+class Generator(nn.Module):
+    def __init__(self, h):
+        super().__init__()
+        self.h = h
+        self.num_kernels = len(h.resblock_kernel_sizes)
+        self.num_upsamples = len(h.upsample_rates)
+
+        in_ch = getattr(h, "model_in_dim", h.embedding_dim)
+        self.conv_pre = weight_norm(
+            nn.Conv1d(in_ch, h.upsample_initial_channel, 7, 1, padding=3)
+        )
+
+        # Upsampling
+        self.ups = nn.ModuleList()
+        for i, (u, k) in enumerate(zip(h.upsample_rates, h.upsample_kernel_sizes)):
+            self.ups.append(
+                weight_norm(
+                    nn.ConvTranspose1d(
+                        h.upsample_initial_channel // (2 ** i),
+                        h.upsample_initial_channel // (2 ** (i + 1)),
+                        k, u, padding=(k - u) // 2
+                    )
+                )
+            )
+
+        # Resblocks
+        self.resblocks = nn.ModuleList()
+        resblock_cls = ResBlock1 if h.resblock == '1' else ResBlock2
+        for i in range(len(self.ups)):
+            ch = h.upsample_initial_channel // (2 ** (i + 1))
+            for k, d in zip(h.resblock_kernel_sizes, h.resblock_dilation_sizes):
+                self.resblocks.append(resblock_cls(h, ch, k, d))
+
+        self.conv_post = weight_norm(nn.Conv1d(ch, 1, 7, 1, padding=3))
+
+    def forward(self, x):
+        x = self.conv_pre(x)
+        for i in range(self.num_upsamples):
+            x = F.leaky_relu(x, 0.1)
+            x = self.ups[i](x)
+            xs = None
+            for j in range(self.num_kernels):
+                rb = self.resblocks[i * self.num_kernels + j]
+                if xs is None:
+                    xs = rb(x)
+                else:
+                    xs += rb(x)
+            x = xs / self.num_kernels
+        x = F.leaky_relu(x, 0.1)
+        x = self.conv_post(x)
+        x = torch.tanh(x)
+        return x
+
+
+class AttrDict(dict):
+    """Simple AttrDict, like Fairseq's."""
+    def __getattr__(self, k):
+        return self[k]
+    def __setattr__(self, k, v):
+        self[k] = v
+    def __delattr__(self, k):
+        del self[k]
+
+
+class CodeGenerator(Generator):
+    """
+    Simplified version of Fairseq's CodeGenerator
+    for your config (no VQ, no quantizer).
+    """
+    def __init__(self, h):
+        super().__init__(h)
+        self.dict = nn.Embedding(h.num_embeddings, h.embedding_dim)
+        self.f0 = h.get('f0', None)
+        self.multispkr = h.get('multispkr', None)
+        self.match_f0_length_to_input = h.get('match_f0_length_to_input', False)
+
+        if self.multispkr:
+            # 200 speakers is what Fairseq uses; you can adjust if needed
+            self.spkr = nn.Embedding(200, h.embedding_dim)
+
+        self.gst_flag = h.get('gst', None)
+        if self.gst_flag:
+            self.gst = nn.Embedding(100, h.gst_embedding_dim)
+
+    @staticmethod
+    def _upsample(signal, max_frames):
+        if signal.dim() == 3:
+            bsz, channels, cond_length = signal.size()
+        elif signal.dim() == 2:
+            signal = signal.unsqueeze(2)
+            bsz, channels, cond_length = signal.size()
+        else:
+            signal = signal.view(-1, 1, 1)
+            bsz, channels, cond_length = signal.size()
+
+        signal = signal.unsqueeze(3).repeat(1, 1, 1, max_frames // cond_length)
+        # assumes perfect divisibility like training
+        signal = signal.view(bsz, channels, max_frames)
+        return signal
+
+    def forward(self, **kwargs):
+        # code: [B,T_code] int
+        x = self.dict(kwargs['code']).transpose(1, 2)  # [B,emb_dim,T_code]
+
+        # f0: [B,1,T_f0]
+        if self.f0:
+            f0_feat = kwargs['f0']
+            if x.shape[-1] < f0_feat.shape[-1] and self.match_f0_length_to_input:
+                f0_feat = F.interpolate(f0_feat, x.shape[-1])
+            elif x.shape[-1] < f0_feat.shape[-1]:
+                x = self._upsample(x, f0_feat.shape[-1])
+            else:
+                f0_feat = self._upsample(f0_feat, x.shape[-1])
+            x = torch.cat([x, f0_feat], dim=1)
+
+        # speaker: [B,1] int
+        if self.multispkr:
+            spkr = self.spkr(kwargs['spkr']).transpose(1, 2)  # [B,emb_dim,1]
+            spkr = self._upsample(spkr, x.shape[-1])
+            x = torch.cat([x, spkr], dim=1)
+
+        # style / gst: [B,1] int
+        if self.gst_flag:
+            style_emb = self.gst(kwargs['style']).squeeze(1)  # [B,gst_dim]
+            # treat as [B,gst_dim,1]
+            style_emb = style_emb.unsqueeze(2)
+            style_emb = self._upsample(style_emb, x.shape[-1])
+            x = torch.cat([x, style_emb], dim=1)
+
+        return super().forward(x)
+
+
+# ============================================================
+# LOAD ALL MODELS
+# ============================================================
+
+def load_es2s_and_prosody():
+    # ES2S
+    es2s = EmotionTransformer(num_emotions=num_emotions).to(device)
+    es2s.load_state_dict(torch.load(ES2S_CKPT, map_location=device))
+    es2s.eval()
+
+    # Prosody
+    prosody_ckpt = torch.load(PROSODY_CKPT, map_location=device)
+    prosody_model = ProsodyPredictor(VOCAB_SIZE, num_emotions, spk_dim).to(device)
+    prosody_model.load_state_dict(prosody_ckpt["state_dict"])
+    prosody_model.eval()
+
+    return es2s, prosody_model
+
+
+def load_hifigan():
+    with open(HIFIGAN_CONFIG, "r") as f:
+        hjson = json.load(f)
+    h = AttrDict(hjson)
+
+    gen = CodeGenerator(h).to(device)
+    ckpt = torch.load(HIFIGAN_CKPT, map_location=device)
+    gen.load_state_dict(ckpt["generator"])
+    gen.eval()
+    print("Loaded HiFiGAN checkpoint from:", HIFIGAN_CKPT)
+    return gen, h
+
+
+# ============================================================
+# FULL EMOTION CONVERSION PIPELINE
+# ============================================================
+
+def convert_units_emotion(units_src, src_spk_id, src_emo_id, tgt_emo_name,
+                          es2s, prosody_model, hifigan_gen, h_cfg,
+                          max_len_units=400):
+    """
+    units_src: list[int]   (raw 0..K-1 discrete units)
+    src_spk_id: int        (speaker id)
+    src_emo_id: int        (source emotion id)
+    tgt_emo_name: str      (e.g. "angry", "amused")
+    """
+
+    # 1) Emotion seq2seq: source -> target emotion units (still SHIFTED)
+    tgt_emo_id = emotion2id[tgt_emo_name]
+
+    src = torch.tensor([[u + SHIFT for u in units_src]], dtype=torch.long).to(device)  # SHIFTED
+    src_mask = torch.zeros_like(src, dtype=torch.bool).to(device)   # no padding
+    src_em = torch.tensor(src_emo_id, dtype=torch.long).to(device)
+    tgt_em = torch.tensor(tgt_emo_id, dtype=torch.long).to(device)
+
+    out_tokens_shifted = greedy_decode_es2s(es2s, src, src_mask, src_em, tgt_em, max_len=max_len_units)
+
+    if len(out_tokens_shifted) == 0:
+        print("Warning: ES2S produced empty sequence, using source units.")
+        out_tokens_shifted = [u + SHIFT for u in units_src]
+
+    # SHIFTED tokens for prosody model
+    units_tgt_shifted = torch.tensor(out_tokens_shifted, dtype=torch.long).unsqueeze(0).to(device)
+    mask = torch.zeros_like(units_tgt_shifted, dtype=torch.bool).to(device)
+
+    # 2) Prosody prediction (f0, dur) at code level
+    emo_ids = torch.tensor([tgt_emo_id], dtype=torch.long).to(device)
+    spk_vec = spk_lookup(torch.tensor([src_spk_id], dtype=torch.long).to(device))
+
+    f0_pred, dur_pred = prosody_model(units_tgt_shifted, emo_ids, spk_vec, mask)
+    # shapes you printed:
+    # f0_pred: (1, T_code)
+    # dur_pred: (1, T_code)
+
+    # 3) Prepare vocoder inputs for CodeGenerator
+    # CodeGenerator expects:
+    #   code: [B,T_code]          (raw 0..K-1 indices)
+    #   f0:   [B,1,T_f0]          (we'll use f0_pred)
+    #   spkr: [B,1]               (speaker id)
+    #   style:[B,1]               (emotion id / style id)
+
+    # map SHIFTED tokens back to raw code indices 0..K-1
+    raw_codes = [max(0, min(K - 1, t - SHIFT)) for t in out_tokens_shifted]
+    code = torch.tensor(raw_codes, dtype=torch.long).unsqueeze(0).to(device)  # [1,T_code]
+
+    # use predicted f0 (no log-normalization for HiFiGAN, config says f0_normalize=false)
+    f0_feat = f0_pred.unsqueeze(1).to(device)  # [1,1,T_code]
+
+    spkr_ids = torch.tensor([[src_spk_id]], dtype=torch.long).to(device)   # [1,1]
+    style_ids = torch.tensor([[tgt_emo_id]], dtype=torch.long).to(device)  # [1,1]
+
+    with torch.no_grad():
+        audio_hat = hifigan_gen(code=code, f0=f0_feat, spkr=spkr_ids, style=style_ids)
+        audio_hat = audio_hat.squeeze().cpu().numpy()
+
+    return audio_hat
+
+
+# ============================================================
+# MAIN EXAMPLE
+# ============================================================
+
+if __name__ == "__main__":
+
+    # -------------------------------------------------
+    # Load models once
+    # -------------------------------------------------
+    es2s, prosody_model = load_es2s_and_prosody()
+    hifigan_gen, h_cfg = load_hifigan()
+
+    # pick an example utterance index
+    i = 300
+
+    units_src = units_dedup[i]     # raw 0..K-1
+    wav_path = paths[i]            # Kaggle-style path
+
+    # absolute path fix
+    wav_abs = kaggle_to_local(wav_path)
+    wav_abs = os.path.normpath(wav_abs)
+
+    # metadata
+    src_spk_id = get_speaker_id_from_path(wav_path)
+    src_emo_id = get_emotion_id_from_path(wav_path)
+
+    print("Original file: ", wav_abs)
+    print("Source speaker id:", src_spk_id, "| name:", get_speaker_name(src_spk_id))
+    print("Source emotion id:", src_emo_id, "| name:", get_emotion_name(src_emo_id))
+
+    # -------------------------------------------------
+    # 1) Load and save original audio
+    # -------------------------------------------------
+    try:
+        wav, sr = sf.read(wav_abs)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load original wav: {wav_abs}") from e
+
+    # stereo -> mono
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+
+    # resample if needed
+    if sr != SAMPLE_RATE:
+        import torchaudio
+        wav_t = torch.tensor(wav).float().unsqueeze(0)
+        wav_t = torchaudio.functional.resample(wav_t, sr, SAMPLE_RATE)
+        wav = wav_t.squeeze(0).numpy()
+        sr = SAMPLE_RATE
+
+    # normalize to avoid clipping
+    if np.max(np.abs(wav)) > 0:
+        wav = wav / np.max(np.abs(wav))
+
+    sf.write("original.wav", wav, SAMPLE_RATE)
+    print("Saved original.wav")
+
+    # -------------------------------------------------
+    # 2) Select target emotion
+    # -------------------------------------------------
+    target_emotion = "Amused"   # change as needed (must be in emotion2id keys)
+    print("Target emotion:", target_emotion)
+
+    # -------------------------------------------------
+    # 3) Run conversion (ES2S + Prosody + Fairseq HiFiGAN)
+    # -------------------------------------------------
+    audio = convert_units_emotion(
+        units_src=units_src,
+        src_spk_id=src_spk_id,
+        src_emo_id=src_emo_id,
+        tgt_emo_name=target_emotion,
+        es2s=es2s,
+        prosody_model=prosody_model,
+        hifigan_gen=hifigan_gen,
+        h_cfg=h_cfg,
+    )
+
+    # normalize vocoder output
+    if np.max(np.abs(audio)) > 0:
+        audio = audio / np.max(np.abs(audio))
+
+    # -------------------------------------------------
+    # 4) Save converted audio
+    # -------------------------------------------------
+    out_name = "converted.wav"
+    sf.write(out_name, audio, SAMPLE_RATE)
+    print(f"Saved {out_name}")
+
+    # -------------------------------------------------
+    # Done
+    # -------------------------------------------------
+    print("\nSUCCESS!")
+    print("Listen to results:")
+    print("  - original.wav")
+    print("  - converted.wav")
