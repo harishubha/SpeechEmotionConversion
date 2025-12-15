@@ -1,0 +1,480 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import soundfile as sf
+import torchaudio
+import torchcrepe
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+DATA_ROOT = "/data/b22_shruti_chaudhary/.cache/kagglehub/datasets/phantasm34/emovdb-sorted/versions/1"
+SAMPLE_RATE = 16000
+HOP_LENGTH = 256
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+discrete = torch.load("discrete_units.pt", map_location="cpu", weights_only=False)
+paths_kaggle = discrete["paths"]
+units_dedup = discrete["units_dedup"]
+
+def to_rel(p):
+    p = p.replace("\\", "/")
+    return "/".join(p.split("/")[-3:])
+
+rel_from_kaggle = [to_rel(p) for p in paths_kaggle]
+
+df = pd.read_csv("emovdb_manifest.csv")
+df["relpath"] = df["filepath"].apply(to_rel)
+
+label_map = torch.load("label_mappings.pt", map_location="cpu")
+emotion2id = label_map["emotion2id"]
+id2emotion = {v: k for k, v in emotion2id.items()}
+num_emotions = len(emotion2id)
+
+spk_table = torch.load("speaker_table.pt", map_location="cpu")
+speaker2id = spk_table["speaker2id"]
+id2speaker = {v: k for k, v in speaker2id.items()}
+spk_dim = spk_table["spk_dim"]
+num_speakers = len(speaker2id)
+
+prosody_data = torch.load("prosody_data.pt", map_location="cpu")
+prosody_entries = prosody_data["entries"]
+
+rel2units_dedup = {to_rel(p): u for p, u in zip(paths_kaggle, units_dedup)}
+
+K = 200
+PAD = 0
+SHIFT = 1
+VOCAB_SIZE = K + SHIFT + 2
+
+def get_local_path(rel):
+    return os.path.join(DATA_ROOT, rel)
+
+def get_speaker_id(relpath):
+    row = df[df["relpath"] == relpath]
+    if row.empty:
+        return 0
+    spk = row.iloc[0]["speaker"]
+    return speaker2id.get(spk, 0)
+
+def get_emotion_id(relpath):
+    row = df[df["relpath"] == relpath]
+    if row.empty:
+        return 0
+    emo = row.iloc[0]["emotion"]
+    return emotion2id.get(emo, 0)
+
+def extract_f0_crepe(wav, sr, hop_length, fmin=50.0, fmax=500.0):
+    if sr != SAMPLE_RATE:
+        wav_t = torch.tensor(wav, dtype=torch.float32).unsqueeze(0)
+        wav_t = torchaudio.functional.resample(wav_t, sr, SAMPLE_RATE)
+        wav = wav_t.squeeze(0).numpy()
+        sr = SAMPLE_RATE
+    audio_t = torch.tensor(wav, dtype=torch.float32, device=device).unsqueeze(0)
+    with torch.no_grad():
+        f0 = torchcrepe.predict(
+            audio_t,
+            sr,
+            hop_length,
+            fmin,
+            fmax,
+            model="full",
+        ).squeeze(0).cpu().numpy()
+    return f0
+
+class VocoderDataset(Dataset):
+    def __init__(self, entries, max_frames=256):
+        self.entries = entries
+        self.max_frames = max_frames
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, idx):
+        e = self.entries[idx]
+        rel = e["relpath"]
+        units_d = e["units_dedup"]
+        dur = e["dur"]
+        spk_id = get_speaker_id(rel)
+        emo_id = get_emotion_id(rel)
+        local_path = get_local_path(rel)
+        wav, sr = sf.read(local_path)
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        if sr != SAMPLE_RATE:
+            wav_t = torch.from_numpy(wav).float().unsqueeze(0)
+            wav_t = torchaudio.functional.resample(wav_t, sr, SAMPLE_RATE)
+            wav = wav_t.squeeze(0).numpy()
+            sr = SAMPLE_RATE
+        u = units_d.long()
+        d = dur.long()
+        unit_frames = []
+        for uid, L in zip(u.tolist(), d.tolist()):
+            if L <= 0:
+                continue
+            unit_frames.extend([uid] * L)
+        unit_frames = torch.tensor(unit_frames, dtype=torch.long)
+        if len(unit_frames) == 0:
+            unit_frames = torch.zeros(1, dtype=torch.long)
+        T = len(unit_frames)
+        max_T = self.max_frames
+        if T > max_T:
+            start = np.random.randint(0, T - max_T + 1)
+            end = start + max_T
+            unit_frames = unit_frames[start:end]
+            T = max_T
+        else:
+            pad_T = max_T - T
+            unit_frames = torch.cat(
+                [unit_frames, torch.full((pad_T,), PAD, dtype=torch.long)]
+            )
+            T = max_T
+        audio_len = T * HOP_LENGTH
+        if len(wav) < audio_len:
+            pad = audio_len - len(wav)
+            wav = np.pad(wav, (0, pad))
+        else:
+            start = np.random.randint(0, len(wav) - audio_len + 1)
+            wav = wav[start:start + audio_len]
+        f0_full = extract_f0_crepe(wav, SAMPLE_RATE, HOP_LENGTH)
+        if len(f0_full) <= 1:
+            f0_full = np.zeros(T, dtype=np.float32)
+        else:
+            x_old = np.linspace(0, 1, num=len(f0_full))
+            x_new = np.linspace(0, 1, num=T)
+            f0_full = np.interp(x_new, x_old, f0_full).astype(np.float32)
+        f0_frames = torch.tensor(f0_full, dtype=torch.float32)
+        wav = torch.tensor(wav, dtype=torch.float32)
+        return {
+            "units": unit_frames,
+            "f0": f0_frames,
+            "audio": wav,
+            "spk_id": torch.tensor(spk_id, dtype=torch.long),
+            "emo_id": torch.tensor(emo_id, dtype=torch.long),
+        }
+
+def collate_vocoder(batch):
+    units = torch.stack([b["units"] for b in batch])
+    f0 = torch.stack([b["f0"] for b in batch])
+    audio = torch.stack([b["audio"] for b in batch])
+    spk = torch.stack([b["spk_id"] for b in batch])
+    emo = torch.stack([b["emo_id"] for b in batch])
+    return {
+        "units": units,
+        "f0": f0,
+        "audio": audio,
+        "spk_id": spk,
+        "emo_id": emo,
+    }
+
+vocoder_ds = VocoderDataset(prosody_entries)
+vocoder_loader = DataLoader(vocoder_ds, batch_size=2, shuffle=True, collate_fn=collate_vocoder)
+
+class SpeakerLookup(nn.Module):
+    def __init__(self, num_speakers, spk_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(num_speakers, spk_dim)
+    def forward(self, spk_ids):
+        return self.embedding(spk_ids)
+
+spk_lookup = SpeakerLookup(num_speakers, spk_dim)
+spk_lookup.load_state_dict(spk_table["state_dict"])
+spk_lookup = spk_lookup.to(device)
+spk_lookup.eval()
+
+emo_dim = 32
+unit_emb_dim = 256
+
+class VocoderConditioner(nn.Module):
+    def __init__(self, vocab_size, num_emotions, spk_dim, unit_emb_dim=256, emo_dim=32):
+        super().__init__()
+        self.unit_emb = nn.Embedding(vocab_size, unit_emb_dim, padding_idx=PAD)
+        self.emo_emb = nn.Embedding(num_emotions, emo_dim)
+        self.proj_spk = nn.Linear(spk_dim, emo_dim)
+    def forward(self, units, f0, spk_vecs, emo_ids):
+        u = self.unit_emb(units + SHIFT)
+        f0 = f0.unsqueeze(-1)
+        emo = self.emo_emb(emo_ids).unsqueeze(1)
+        spk_p = self.proj_spk(spk_vecs).unsqueeze(1)
+        emo_exp = emo.expand(-1, u.size(1), -1)
+        spk_exp = spk_p.expand(-1, u.size(1), -1)
+        cond = torch.cat([u, f0, emo_exp, spk_exp], dim=-1)
+        return cond.transpose(1, 2)
+
+class ResBlock(nn.Module):
+    def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
+        super().__init__()
+        self.convs1 = nn.ModuleList([
+            nn.utils.weight_norm(
+                nn.Conv1d(channels, channels, kernel_size, 1,
+                          padding=d * (kernel_size - 1) // 2, dilation=d)
+            )
+            for d in dilation
+        ])
+        self.convs2 = nn.ModuleList([
+            nn.utils.weight_norm(
+                nn.Conv1d(channels, channels, kernel_size, 1,
+                          padding=(kernel_size - 1) // 2)
+            )
+            for _ in dilation
+        ])
+    def forward(self, x):
+        for c1, c2 in zip(self.convs1, self.convs2):
+            y = F.leaky_relu(x, 0.1)
+            y = c1(y)
+            y = F.leaky_relu(y, 0.1)
+            y = c2(y)
+            x = x + y
+        return x
+
+class HiFiGAN_Generator(nn.Module):
+    def __init__(self, cond_dim, channels=512, upsample_rates=(8, 8, 2, 2), upsample_kernel_sizes=(16, 16, 4, 4)):
+        super().__init__()
+        self.conv_pre = nn.utils.weight_norm(nn.Conv1d(cond_dim, channels, 7, 1, padding=3))
+        self.ups = nn.ModuleList()
+        self.resblocks = nn.ModuleList()
+        in_ch = channels
+        for u, k in zip(upsample_rates, upsample_kernel_sizes):
+            self.ups.append(
+                nn.utils.weight_norm(
+                    nn.ConvTranspose1d(in_ch, in_ch // 2, k, u, padding=(k - u) // 2)
+                )
+            )
+            in_ch = in_ch // 2
+            self.resblocks.append(nn.ModuleList([ResBlock(in_ch) for _ in range(3)]))
+        self.conv_post = nn.utils.weight_norm(nn.Conv1d(in_ch, 1, 7, 1, padding=3))
+    def forward(self, x):
+        x = self.conv_pre(x)
+        for up, rbs in zip(self.ups, self.resblocks):
+            x = F.leaky_relu(x, 0.1)
+            x = up(x)
+            out = 0
+            for rb in rbs:
+                out += rb(x)
+            x = out / len(rbs)
+        x = F.leaky_relu(x, 0.1)
+        x = self.conv_post(x)
+        return torch.tanh(x)
+
+class MPD_Block(nn.Module):
+    def __init__(self, period):
+        super().__init__()
+        self.period = period
+        self.convs = nn.ModuleList([
+            nn.utils.weight_norm(nn.Conv2d(1, 32, (5, 1), (3, 1), padding=(2, 0))),
+            nn.utils.weight_norm(nn.Conv2d(32, 128, (5, 1), (3, 1), padding=(2, 0))),
+            nn.utils.weight_norm(nn.Conv2d(128, 512, (5, 1), (3, 1), padding=(2, 0))),
+            nn.utils.weight_norm(nn.Conv2d(512, 1024, (5, 1), (3, 1), padding=(2, 0))),
+            nn.utils.weight_norm(nn.Conv2d(1024, 1024, (5, 1), 1, padding=(2, 0))),
+        ])
+        self.conv_post = nn.utils.weight_norm(nn.Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
+    def forward(self, x):
+        b, c, t = x.shape
+        pad = (self.period - (t % self.period)) % self.period
+        x = F.pad(x, (0, pad), mode="reflect")
+        t = x.shape[-1]
+        x = x.view(b, 1, t // self.period, self.period)
+        feats = []
+        for l in self.convs:
+            x = l(x)
+            x = F.leaky_relu(x, 0.1)
+            feats.append(x)
+        x = self.conv_post(x)
+        feats.append(x)
+        x = x.reshape(b, -1)
+        return x, feats
+
+class MultiPeriodDiscriminator(nn.Module):
+    def __init__(self, periods=[2, 3, 5, 7, 11]):
+        super().__init__()
+        self.blocks = nn.ModuleList([MPD_Block(p) for p in periods])
+    def forward(self, x):
+        ret = []
+        for b in self.blocks:
+            score, feat = b(x)
+            ret.append((score, feat))
+        return ret
+
+class MSD_Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            nn.utils.weight_norm(nn.Conv1d(1, 128, 15, 1, padding=7)),
+            nn.utils.weight_norm(nn.Conv1d(128, 128, 41, 2, padding=20, groups=4)),
+            nn.utils.weight_norm(nn.Conv1d(128, 256, 41, 2, padding=20, groups=16)),
+            nn.utils.weight_norm(nn.Conv1d(256, 512, 41, 2, padding=20, groups=16)),
+            nn.utils.weight_norm(nn.Conv1d(512, 512, 41, 2, padding=20, groups=16)),
+            nn.utils.weight_norm(nn.Conv1d(512, 512, 5, 1, padding=2)),
+        ])
+        self.conv_post = nn.utils.weight_norm(nn.Conv1d(512, 1, 3, 1, padding=1))
+    def forward(self, x):
+        feats = []
+        for l in self.convs:
+            x = l(x)
+            x = F.leaky_relu(x, 0.1)
+            feats.append(x)
+        x = self.conv_post(x)
+        feats.append(x)
+        return x, feats
+
+class MultiScaleDiscriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.b0 = MSD_Block()
+        self.b1 = MSD_Block()
+        self.b2 = MSD_Block()
+        self.avg = nn.AvgPool1d(4, 2, padding=2)
+    def forward(self, x):
+        outs = []
+        x1 = x
+        outs.append(self.b0(x1))
+        x2 = self.avg(x1)
+        outs.append(self.b1(x2))
+        x3 = self.avg(x2)
+        outs.append(self.b2(x3))
+        return outs
+
+def loss_adv_g(scores):
+    loss = 0
+    for s in scores:
+        loss += torch.mean((1 - s) ** 2)
+    return loss
+
+def loss_adv_d(real_scores, fake_scores):
+    loss = 0
+    for r, f in zip(real_scores, fake_scores):
+        loss += torch.mean((r - 1) ** 2) + torch.mean(f ** 2)
+    return loss
+
+def feature_matching(real_feats, fake_feats):
+    loss = 0
+    for r, f in zip(real_feats, fake_feats):
+        for rr, ff in zip(r, f):
+            loss += torch.mean(torch.abs(rr - ff))
+    return loss
+
+def log_norm_f0(f0):
+    f0 = f0.clone()
+    f0[f0 <= 0] = 1.0
+    f0 = torch.log(f0)
+    m = f0.mean()
+    s = f0.std().clamp(min=1e-6)
+    return (f0 - m) / s
+
+cond_dim = unit_emb_dim + 1 + emo_dim + emo_dim
+
+generator = HiFiGAN_Generator(cond_dim=cond_dim).to(device)
+mpd = MultiPeriodDiscriminator().to(device)
+msd = MultiScaleDiscriminator().to(device)
+cond_net = VocoderConditioner(VOCAB_SIZE, num_emotions, spk_dim, unit_emb_dim=unit_emb_dim, emo_dim=emo_dim).to(device)
+
+optim_g = torch.optim.Adam(generator.parameters(), lr=2e-4, betas=(0.8, 0.99))
+optim_d = torch.optim.Adam(list(mpd.parameters()) + list(msd.parameters()), lr=2e-4, betas=(0.8, 0.99))
+
+ckpt_start = "hifigan_vocoder_epoch50.pt"
+if os.path.exists(ckpt_start):
+    ck = torch.load(ckpt_start, map_location=device)
+    generator.load_state_dict(ck["generator"])
+    mpd.load_state_dict(ck["mpd"])
+    msd.load_state_dict(ck["msd"])
+    cond_net.load_state_dict(ck["cond_net"])
+
+def discriminator_step(batch):
+    units = batch["units"].to(device)
+    f0 = batch["f0"].to(device)
+    audio = batch["audio"].to(device)
+    spk_id = batch["spk_id"].to(device)
+    emo_id = batch["emo_id"].to(device)
+    with torch.no_grad():
+        spk_vecs = spk_lookup(spk_id)
+        f0n = log_norm_f0(f0)
+        cond = cond_net(units, f0n, spk_vecs, emo_id)
+        fake_audio = generator(cond).squeeze(1)
+        fake_audio = fake_audio[:, :audio.size(1)]
+    real = audio.unsqueeze(1)
+    fake = fake_audio.unsqueeze(1)
+    r_mpd = mpd(real)
+    f_mpd = mpd(fake)
+    r_msd = msd(real)
+    f_msd = msd(fake)
+    real_scores = [x[0] for x in r_mpd] + [x[0] for x in r_msd]
+    fake_scores = [x[0] for x in f_mpd] + [x[0] for x in f_msd]
+    loss_d = loss_adv_d(real_scores, fake_scores)
+    return loss_d
+
+def generator_step(batch):
+    units = batch["units"].to(device)
+    f0 = batch["f0"].to(device)
+    audio = batch["audio"].to(device)
+    spk_id = batch["spk_id"].to(device)
+    emo_id = batch["emo_id"].to(device)
+    spk_vecs = spk_lookup(spk_id)
+    f0n = log_norm_f0(f0)
+    cond = cond_net(units, f0n, spk_vecs, emo_id)
+    fake_audio = generator(cond).squeeze(1)
+    fake_audio = fake_audio[:, :audio.size(1)]
+    real = audio.unsqueeze(1)
+    fake = fake_audio.unsqueeze(1)
+    r_mpd = mpd(real)
+    f_mpd = mpd(fake)
+    r_msd = msd(real)
+    f_msd = msd(fake)
+    adv = loss_adv_g([x[0] for x in f_mpd] + [x[0] for x in f_msd])
+    fm = feature_matching(
+        [x[1] for x in r_mpd] + [x[1] for x in r_msd],
+        [x[1] for x in f_mpd] + [x[1] for x in f_msd],
+    )
+    l1 = F.l1_loss(fake_audio, audio)
+    loss_g = adv + 10 * l1 + 2 * fm
+    return loss_g
+
+if __name__ == "__main__":
+    num_epochs = 130
+    for epoch in range(num_epochs):
+        generator.train()
+        mpd.train()
+        msd.train()
+        total_g = 0.0
+        total_d = 0.0
+        pbar = tqdm(vocoder_loader, desc=f"Epoch {epoch+1}/{num_epochs}", ncols=120)
+        for i, batch in enumerate(pbar):
+            optim_d.zero_grad()
+            ld = discriminator_step(batch)
+            ld.backward()
+            optim_d.step()
+
+            optim_g.zero_grad()
+            lg = generator_step(batch)
+            lg.backward()
+            optim_g.step()
+
+            total_d += ld.item()
+            total_g += lg.item()
+
+            avg_d = total_d / (i+1)
+            avg_g = total_g / (i+1)
+
+            pbar.set_postfix({
+                "D": f"{ld.item():.3f}",
+                "G": f"{lg.item():.3f}",
+                "D_avg": f"{avg_d:.3f}",
+                "G_avg": f"{avg_g:.3f}",
+            })
+
+        # end epoch
+        d_epoch = total_d / len(vocoder_loader)
+        g_epoch = total_g / len(vocoder_loader)
+        print(f"\nEpoch {epoch+1}/{num_epochs} DONE | D_avg={d_epoch:.3f} | G_avg={g_epoch:.3f}\n")
+       
+       # print(f"\nEpoch {epoch+1}/{num_epochs} DONE | D={total_d:.2f} | G={total_g:.2f}\n")
+        if (epoch + 1) % 10 == 0:
+            ckpt_path = f"hifigan_vocoder_epoch_ft_{epoch+1}.pt"
+            torch.save({
+                "generator": generator.state_dict(),
+                "mpd": mpd.state_dict(),
+                "msd": msd.state_dict(),
+                "cond_net": cond_net.state_dict()
+            }, ckpt_path)
+            print(f"Saved checkpoint: {ckpt_path}")
